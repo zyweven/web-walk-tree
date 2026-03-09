@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Web Walk Tree 导出</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    select { padding: 6px; }
+    button { padding: 6px 10px; margin-left: 8px; }
+    pre { background: #f7f7f7; padding: 8px; overflow: auto; }
+  </style>
+  </head>
+<body>
+  <div>
+    <label>选择会话</label>
+    <select id="sessionSelect"></select>
+    <button id="exportBtn">导出 JSON</button>
+  </div>
+  <pre id="preview"></pre>
+  <script src="options.js"></script>
+</body>
+</html>
