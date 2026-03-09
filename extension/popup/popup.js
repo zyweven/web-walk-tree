@@ -24,6 +24,10 @@ document.getElementById("openSidePanel").onclick = async () => {
   await chrome.sidePanel.open({ tabId: tab.id })
 }
 
+document.getElementById("openVisualizer").onclick = async () => {
+  await chrome.tabs.create({ url: chrome.runtime.getURL("visualizer.html") })
+}
+
 document.getElementById("clearData").onclick = async () => {
   if (!confirm('确定要清空所有浏览记录吗？此操作不可恢复！')) return
   await chrome.runtime.sendMessage({ type: "clear-data" })

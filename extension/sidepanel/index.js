@@ -8,6 +8,20 @@ const EDGE_COLORS = {
   default: "#94a3b8"
 }
 
+const ROOT_SELECT_ALL = "__all__"
+const ROOT_GROUP_COLORS = [
+  "#0ea5e9",
+  "#10b981",
+  "#f59e0b",
+  "#8b5cf6",
+  "#ef4444",
+  "#14b8a6",
+  "#f97316",
+  "#6366f1",
+  "#22c55e",
+  "#e11d48"
+]
+
 const state = {
   dashboard: null,
   settings: null,
@@ -166,6 +180,12 @@ function populateRootSelect(nodes, edges, currentNodeId) {
   autoOption.textContent = "自动根节点"
   select.appendChild(autoOption)
 
+  const allOption = document.createElement("option")
+  allOption.value = ROOT_SELECT_ALL
+  allOption.textContent = "全部（全局视角）"
+  allOption.disabled = !roots.length
+  select.appendChild(allOption)
+
   roots.forEach((node) => {
     const option = document.createElement("option")
     option.value = node.id
@@ -173,26 +193,79 @@ function populateRootSelect(nodes, edges, currentNodeId) {
     select.appendChild(option)
   })
 
-  const autoRootId = guessRootId(nodes, edges, currentNodeId)
-  if (state.selectedRootId && roots.some((root) => root.id === state.selectedRootId)) {
+  const picked = state.selectedRootId
+  if (picked === ROOT_SELECT_ALL || roots.some((root) => root.id === picked)) {
     select.value = state.selectedRootId
   } else {
     select.value = ""
-    state.selectedRootId = autoRootId
+    state.selectedRootId = ""
   }
 }
 
-function buildGraph(nodes, edges, rootId, currentNodeId, searchText) {
+function buildRootColorMap(rootIds) {
+  const map = new Map()
+  rootIds.forEach((rootId, index) => {
+    map.set(rootId, ROOT_GROUP_COLORS[index % ROOT_GROUP_COLORS.length])
+  })
+  return map
+}
+
+function deriveRootGroupByNode(nodes, edges, rootIds) {
+  const groupByNode = new Map()
+  if (!rootIds.length) return groupByNode
+
+  const outEdges = new Map()
+  edges.forEach((edge) => {
+    const list = outEdges.get(edge.fromNodeId) || []
+    list.push(edge.toNodeId)
+    outEdges.set(edge.fromNodeId, list)
+  })
+
+  const queue = []
+  rootIds.forEach((rootId) => {
+    groupByNode.set(rootId, rootId)
+    queue.push(rootId)
+  })
+
+  for (let i = 0; i < queue.length; i += 1) {
+    const nodeId = queue[i]
+    const groupId = groupByNode.get(nodeId)
+    const outgoing = outEdges.get(nodeId) || []
+    outgoing.forEach((childId) => {
+      if (groupByNode.has(childId)) return
+      groupByNode.set(childId, groupId)
+      queue.push(childId)
+    })
+  }
+
+  const fallbackRootId = rootIds[0]
+  nodes.forEach((node) => {
+    if (groupByNode.has(node.id)) return
+    if (node.isRoot) {
+      groupByNode.set(node.id, node.id)
+      return
+    }
+    groupByNode.set(node.id, fallbackRootId)
+  })
+
+  return groupByNode
+}
+
+function buildGraph(nodes, edges, rootValue, currentNodeId, searchText) {
   const nodeById = new Map(nodes.map((node) => [node.id, { ...node }]))
   const validEdges = edges.filter((edge) => nodeById.has(edge.fromNodeId) && nodeById.has(edge.toNodeId))
+  const allRoots = nodes.filter((node) => node.isRoot).sort((a, b) => a.firstSeenAt - b.firstSeenAt)
+  const globalMode = rootValue === ROOT_SELECT_ALL
 
-  let pickedRootId = rootId
-  if (!pickedRootId || !nodeById.has(pickedRootId)) {
+  let pickedRootId = rootValue
+  if (globalMode) {
+    pickedRootId = ""
+  } else if (!pickedRootId || !nodeById.has(pickedRootId)) {
     pickedRootId = guessRootId(nodes, validEdges, currentNodeId)
   }
 
   let visibleIds = new Set(nodeById.keys())
-  if (pickedRootId && nodeById.has(pickedRootId)) {
+  if (!globalMode && pickedRootId && nodeById.has(pickedRootId)) {
     visibleIds = new Set([pickedRootId])
     const queue = [pickedRootId]
     while (queue.length) {
@@ -251,8 +324,32 @@ function buildGraph(nodes, edges, rootId, currentNodeId, searchText) {
     outEdges.set(edge.fromNodeId, list)
   })
 
+  const graphRoots = filteredNodes.filter((node) => node.isRoot).sort((a, b) => a.firstSeenAt - b.firstSeenAt)
+  const graphRootIds = graphRoots.map((node) => node.id)
+  const rootColorById = buildRootColorMap(graphRootIds.length ? graphRootIds : allRoots.map((node) => node.id))
+  const groupByNode = globalMode
+    ? deriveRootGroupByNode(filteredNodes, filteredEdges, graphRootIds)
+    : new Map(filteredNodes.map((node) => [node.id, pickedRootId]))
+
   const depthByNode = new Map()
-  if (pickedRootId && graphNodeById.has(pickedRootId)) {
+  if (globalMode) {
+    const queue = []
+    graphRootIds.forEach((rootId) => {
+      depthByNode.set(rootId, 0)
+      queue.push(rootId)
+    })
+    while (queue.length) {
+      const id = queue.shift()
+      const depth = depthByNode.get(id)
+      const outgoing = outEdges.get(id) || []
+      outgoing.forEach((edge) => {
+        if (!depthByNode.has(edge.toNodeId)) {
+          depthByNode.set(edge.toNodeId, depth + 1)
+          queue.push(edge.toNodeId)
+        }
+      })
+    }
+  } else if (pickedRootId && graphNodeById.has(pickedRootId)) {
     depthByNode.set(pickedRootId, 0)
     const queue = [pickedRootId]
     while (queue.length) {
@@ -270,7 +367,9 @@ function buildGraph(nodes, edges, rootId, currentNodeId, searchText) {
 
   const preparedNodes = filteredNodes.map((node) => {
     const depth = depthByNode.has(node.id) ? depthByNode.get(node.id) : 1
-    const radius = node.id === currentNodeId ? 17 : (node.id === pickedRootId ? 15 : 12)
+    const groupRootId = groupByNode.get(node.id) || (node.isRoot ? node.id : "")
+    const groupColor = rootColorById.get(groupRootId) || ROOT_GROUP_COLORS[0]
+    const radius = node.id === currentNodeId ? 17 : ((!globalMode && node.id === pickedRootId) ? 15 : 12)
     return {
       ...node,
       depth,
@@ -280,19 +379,89 @@ function buildGraph(nodes, edges, rootId, currentNodeId, searchText) {
       vx: 0,
       vy: 0,
       isCurrent: node.id === currentNodeId,
-      isPickedRoot: node.id === pickedRootId
+      isPickedRoot: !globalMode && node.id === pickedRootId,
+      groupRootId,
+      groupColor
     }
   })
 
   return {
-    rootId: pickedRootId,
+    rootId: globalMode ? "" : pickedRootId,
+    rootIds: graphRootIds,
+    isGlobal: globalMode,
     nodes: preparedNodes,
     edges: filteredEdges
   }
 }
 
+function buildRootAnchors(rootIds) {
+  const anchors = new Map()
+  if (!rootIds.length) return anchors
+
+  const ringRadius = Math.max(220, 150 + rootIds.length * 36)
+  const angleStep = (Math.PI * 2) / rootIds.length
+
+  rootIds.forEach((rootId, index) => {
+    const angle = -Math.PI / 2 + index * angleStep
+    anchors.set(rootId, {
+      x: Math.cos(angle) * ringRadius,
+      y: Math.sin(angle) * ringRadius
+    })
+  })
+
+  return anchors
+}
+
 function initNodePositions(graph) {
   if (!graph.nodes.length) return
+
+  if (graph.isGlobal && graph.rootIds.length) {
+    const nodeById = new Map(graph.nodes.map((node) => [node.id, node]))
+    const anchors = buildRootAnchors(graph.rootIds)
+
+    graph.rootIds.forEach((rootId) => {
+      const node = nodeById.get(rootId)
+      const anchor = anchors.get(rootId)
+      if (!node || !anchor) return
+      node.x = anchor.x
+      node.y = anchor.y
+    })
+
+    const groupByRoot = new Map()
+    graph.nodes.forEach((node) => {
+      if (node.isRoot) return
+      const groupId = node.groupRootId || graph.rootIds[0]
+      const list = groupByRoot.get(groupId) || []
+      list.push(node)
+      groupByRoot.set(groupId, list)
+    })
+
+    groupByRoot.forEach((nodesInGroup, rootId) => {
+      const anchor = anchors.get(rootId) || { x: 0, y: 0 }
+      const byDepth = new Map()
+      nodesInGroup.forEach((node) => {
+        const list = byDepth.get(node.depth) || []
+        list.push(node)
+        byDepth.set(node.depth, list)
+      })
+
+      const maxDepth = Math.max(...nodesInGroup.map((node) => node.depth || 1), 1)
+      for (let depth = 1; depth <= maxDepth; depth += 1) {
+        const layer = byDepth.get(depth) || []
+        if (!layer.length) continue
+        const radius = 110 + depth * 86
+        const step = (Math.PI * 2) / layer.length
+        const offset = (depth % 2) * 0.35
+        layer.forEach((node, index) => {
+          const angle = offset + step * index
+          node.x = anchor.x + Math.cos(angle) * radius
+          node.y = anchor.y + Math.sin(angle) * radius
+        })
+      }
+    })
+
+    return
+  }
 
   const byDepth = new Map()
   graph.nodes.forEach((node) => {
@@ -327,6 +496,8 @@ function runForceLayout(graph) {
 
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
   const root = nodes.find((node) => node.id === graph.rootId) || nodes[0]
+  const rootSet = new Set(graph.rootIds || [])
+  const rootAnchors = graph.isGlobal ? buildRootAnchors(graph.rootIds || []) : new Map()
   const iterations = nodes.length > 220 ? 120 : 220
 
   for (let tick = 0; tick < iterations; tick += 1) {
@@ -385,9 +556,23 @@ function runForceLayout(graph) {
     })
 
     nodes.forEach((node) => {
-      if (node.id === root.id) {
+      if (graph.isGlobal && rootSet.has(node.id)) {
+        const anchor = rootAnchors.get(node.id) || { x: 0, y: 0 }
+        node.vx += (anchor.x - node.x) * 0.028
+        node.vy += (anchor.y - node.y) * 0.028
+      } else if (node.id === root.id) {
         node.vx += (0 - node.x) * 0.02
         node.vy += (0 - node.y) * 0.02
+      } else if (graph.isGlobal) {
+        const depth = Math.max(1, node.depth || 1)
+        const targetRadius = 110 + depth * 86
+        const anchor = rootAnchors.get(node.groupRootId) || { x: 0, y: 0 }
+        const offX = node.x - anchor.x
+        const offY = node.y - anchor.y
+        const dist = Math.max(1, Math.sqrt(offX * offX + offY * offY))
+        const radial = (targetRadius - dist) * 0.0018
+        node.vx += (offX / dist) * radial
+        node.vy += (offY / dist) * radial
       } else {
         const depth = Math.max(1, node.depth || 1)
         const targetRadius = 120 + depth * 130
@@ -405,6 +590,17 @@ function runForceLayout(graph) {
       node.x = Math.max(-2400, Math.min(2400, node.x))
       node.y = Math.max(-2400, Math.min(2400, node.y))
     })
+  }
+
+  if (graph.isGlobal) {
+    graph.rootIds.forEach((rootId) => {
+      const node = nodeById.get(rootId)
+      const anchor = rootAnchors.get(rootId)
+      if (!node || !anchor) return
+      node.x = anchor.x
+      node.y = anchor.y
+    })
+    return
   }
 
   root.x = 0
@@ -476,6 +672,15 @@ function updateGeometry() {
   })
 }
 
+function resolveNodeColor(node, graph) {
+  if (node.isCurrent) return null
+  if (graph && graph.isGlobal) {
+    return node.groupColor || ROOT_GROUP_COLORS[0]
+  }
+  if (node.isPickedRoot) return "#0f766e"
+  return "#3b82f6"
+}
+
 function renderGraph() {
   const graph = state.graph
   const edgeLayer = getEl("edgeLayer")
@@ -508,7 +713,7 @@ function renderGraph() {
   graph.nodes.forEach((node) => {
     const g = document.createElementNS("http://www.w3.org/2000/svg", "g")
     g.classList.add("node")
-    if (node.isPickedRoot) g.classList.add("root")
+    if (node.isPickedRoot || (graph.isGlobal && node.isRoot)) g.classList.add("root")
     if (node.isCurrent) g.classList.add("current")
     g.dataset.nodeId = node.id
 
@@ -519,6 +724,10 @@ function renderGraph() {
     const base = document.createElementNS("http://www.w3.org/2000/svg", "circle")
     base.classList.add("base")
     base.setAttribute("r", String(node.radius))
+    const color = resolveNodeColor(node, graph)
+    if (color) {
+      base.setAttribute("fill", color)
+    }
 
     const label = document.createElementNS("http://www.w3.org/2000/svg", "text")
     label.setAttribute("x", String(node.radius + 6))
@@ -567,6 +776,24 @@ function renderBreadcrumb() {
   }
 
   const current = graph.nodes.find((node) => node.isCurrent)
+  if (graph.isGlobal) {
+    if (!current) {
+      el.textContent = "全局视角：当前页未落在可视化结果中"
+      return
+    }
+    if (current.isRoot) {
+      el.textContent = `全局视角：${hostOf(current.url)}（当前页是根节点）`
+      return
+    }
+    const groupRoot = graph.nodes.find((node) => node.id === current.groupRootId)
+    if (groupRoot) {
+      el.textContent = `全局视角：${hostOf(current.url)} · 归属根 ${hostOf(groupRoot.url)}`
+      return
+    }
+    el.textContent = `全局视角：${hostOf(current.url)}`
+    return
+  }
+
   const rootId = graph.rootId
   if (!current || !rootId) {
     el.textContent = "当前页未落在可视化子树中"
@@ -625,7 +852,8 @@ function renderStats() {
   const totalEdges = state.sessionData.edges.length
   const shownNodes = state.graph ? state.graph.nodes.length : 0
   const shownEdges = state.graph ? state.graph.edges.length : 0
-  statsText.textContent = `总节点 ${totalNodes} / 展示 ${shownNodes} · 总边 ${totalEdges} / 展示 ${shownEdges}`
+  const modeText = state.graph && state.graph.isGlobal ? "全局" : "单根"
+  statsText.textContent = `总节点 ${totalNodes} / 展示 ${shownNodes} · 总边 ${totalEdges} / 展示 ${shownEdges} · 视角 ${modeText}`
 }
 
 function updatePauseUI() {
@@ -649,8 +877,8 @@ function rebuildGraph() {
     return
   }
 
-  const rootSelectValue = getEl("rootSelect").value
-  const selectedRootId = rootSelectValue || state.selectedRootId || ""
+  const selectedRootId = getEl("rootSelect").value || ""
+  state.selectedRootId = selectedRootId
 
   state.graph = buildGraph(
     state.sessionData.nodes,
@@ -739,7 +967,7 @@ function bindControls() {
   })
 
   getEl("rootSelect").addEventListener("change", (event) => {
-    state.selectedRootId = event.target.value || state.selectedRootId
+    state.selectedRootId = event.target.value || ""
     state.autoFit = true
     rebuildGraph()
   })
