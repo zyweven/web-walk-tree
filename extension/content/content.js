@@ -1,54 +1,103 @@
-function cssPath(el) {
-  if (!(el instanceof Element)) return ""
-  const path = []
-  while (el && el.nodeType === Node.ELEMENT_NODE) {
-    let selector = el.nodeName.toLowerCase()
-    if (el.id) {
-      selector += `#${el.id}`
-      path.unshift(selector)
+function cssPath(element) {
+  if (!(element instanceof Element)) return ""
+
+  const segments = []
+  let current = element
+
+  while (current && current.nodeType === Node.ELEMENT_NODE) {
+    let selector = current.nodeName.toLowerCase()
+    if (current.id) {
+      selector += `#${current.id}`
+      segments.unshift(selector)
       break
-    } else {
-      let sib = el, nth = 1
-      while (sib = sib.previousElementSibling) {
-        if (sib.nodeName.toLowerCase() === selector) nth++
-      }
-      selector += `:nth-of-type(${nth})`
     }
-    path.unshift(selector)
-    el = el.parentElement
+
+    let sibling = current
+    let index = 1
+    while ((sibling = sibling.previousElementSibling)) {
+      if (sibling.nodeName.toLowerCase() === selector) index += 1
+    }
+
+    selector += `:nth-of-type(${index})`
+    segments.unshift(selector)
+    current = current.parentElement
   }
-  return path.join(" > ")
+
+  return segments.join(" > ")
 }
 
-function getAnchor(target) {
-  let el = target
-  while (el && el !== document.body) {
-    if (el.tagName && el.tagName.toLowerCase() === "a" && el.href) return el
-    el = el.parentElement
+function findAnchor(target) {
+  let current = target
+  while (current && current !== document.body) {
+    if (current.tagName && current.tagName.toLowerCase() === "a" && current.href) {
+      return current
+    }
+    current = current.parentElement
   }
   return null
 }
 
-function reportIntent(e) {
-  const a = getAnchor(e.target)
-  if (!a || !a.href) return
-  const href = a.href
-  const anchorText = (a.textContent || "").trim().slice(0, 200)
-  const domPath = cssPath(a)
-  chrome.runtime.sendMessage({ type: "link-intent", href, anchorText, domPath })
+function getPageFavicon() {
+  const icon = document.querySelector("link[rel~='icon']")
+  return icon && icon.href ? icon.href : ""
 }
 
+function sendMessage(payload) {
+  try {
+    chrome.runtime.sendMessage(payload)
+  } catch (error) {
+    // Ignore transient runtime errors.
+  }
+}
+
+function reportIntent(event) {
+  const anchor = findAnchor(event.target)
+  if (!anchor || !anchor.href) return
+
+  const anchorText = (anchor.textContent || "").trim().slice(0, 240)
+  sendMessage({
+    type: "link-intent",
+    href: anchor.href,
+    anchorText,
+    domPath: cssPath(anchor)
+  })
+}
+
+let lastRouteHref = location.href
+
+function reportRouteChange(routeKind) {
+  const currentHref = location.href
+  if (!currentHref || currentHref === lastRouteHref) return
+
+  sendMessage({
+    type: "route-change",
+    href: currentHref,
+    fromHref: lastRouteHref,
+    routeKind,
+    title: document.title || "",
+    faviconUrl: getPageFavicon()
+  })
+
+  lastRouteHref = currentHref
+}
+
+const originalPushState = history.pushState
+const originalReplaceState = history.replaceState
+
+history.pushState = function patchedPushState() {
+  const result = originalPushState.apply(this, arguments)
+  reportRouteChange("pushState")
+  return result
+}
+
+history.replaceState = function patchedReplaceState() {
+  const result = originalReplaceState.apply(this, arguments)
+  reportRouteChange("replaceState")
+  return result
+}
+
+window.addEventListener("popstate", () => reportRouteChange("popstate"), true)
+window.addEventListener("hashchange", () => reportRouteChange("hashchange"), true)
 document.addEventListener("click", reportIntent, { capture: true })
 document.addEventListener("auxclick", reportIntent, { capture: true })
-
-function reportRoute() {
-  try {
-    chrome.runtime.sendMessage({ type: "route-change", href: location.href })
-  } catch (e) {}
-}
-
-const _pushState = history.pushState
-const _replaceState = history.replaceState
-history.pushState = function() { _pushState.apply(this, arguments); reportRoute() }
-history.replaceState = function() { _replaceState.apply(this, arguments); reportRoute() }
-window.addEventListener("popstate", reportRoute)
+document.addEventListener("contextmenu", reportIntent, { capture: true })

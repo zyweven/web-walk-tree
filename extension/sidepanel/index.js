@@ -1,514 +1,901 @@
-async function getStorage(keys) {
-  return await chrome.storage.local.get(keys)
+const EDGE_COLORS = {
+  click: "#0ea5e9",
+  typed: "#6b7280",
+  keyword: "#8b5cf6",
+  redirect: "#f59e0b",
+  back: "#ef4444",
+  forward: "#f97316",
+  default: "#94a3b8"
 }
 
-function sessionKey(id) { return `data:${id}:session` }
-function nodesKey(id) { return `data:${id}:nodes` }
-function edgesKey(id) { return `data:${id}:edges` }
+const state = {
+  dashboard: null,
+  settings: null,
+  sessionData: null,
+  selectedSessionId: "",
+  selectedRootId: "",
+  searchText: "",
+  graph: null,
+  transform: {
+    x: 400,
+    y: 300,
+    scale: 1
+  },
+  autoFit: true,
+  interaction: {
+    mode: null,
+    nodeId: null,
+    startX: 0,
+    startY: 0,
+    moved: false
+  },
+  renderCache: {
+    nodeById: new Map(),
+    edgeEls: [],
+    nodeEls: []
+  }
+}
 
-async function loadSessions() {
-  const { sessions = [], currentSessionId } = await getStorage(["sessions", "currentSessionId"])
-  const sel = document.getElementById("sessionSelect")
-  sel.innerHTML = ""
-  const list = sessions.slice().reverse()
-  const hasCurrent = list.some(s => s.id === currentSessionId)
-  if (currentSessionId && !hasCurrent) list.unshift({ id: currentSessionId })
-  list.forEach(s => {
-    const o = document.createElement("option")
-    o.value = s.id
-    o.textContent = `${s.id}`
-    sel.appendChild(o)
+function getEl(id) {
+  return document.getElementById(id)
+}
+
+function debounce(fn, delay) {
+  let timer = null
+  return (...args) => {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(() => fn(...args), delay)
+  }
+}
+
+async function callBg(type, payload = {}) {
+  const response = await chrome.runtime.sendMessage({ type, ...payload })
+  if (!response || response.ok === false) {
+    throw new Error(response && response.error ? response.error : `request-failed:${type}`)
+  }
+  return response
+}
+
+function escapeHtml(text) {
+  return String(text || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname
+  } catch (error) {
+    return url || ""
+  }
+}
+
+function formatTime(ts) {
+  if (!ts) return "-"
+  try {
+    return new Date(ts).toLocaleString()
+  } catch (error) {
+    return String(ts)
+  }
+}
+
+function trunc(text, max) {
+  const value = String(text || "")
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value
+}
+
+function svgSize() {
+  const svg = getEl("graphSvg")
+  const rect = svg.getBoundingClientRect()
+  return {
+    width: Math.max(360, Math.round(rect.width || 800)),
+    height: Math.max(300, Math.round(rect.height || 600))
+  }
+}
+
+function populateSessionSelect(sessions, currentSessionId) {
+  const select = getEl("sessionSelect")
+  const sorted = [...sessions].sort((a, b) => b.startedAt - a.startedAt)
+  select.innerHTML = ""
+
+  if (!sorted.length) {
+    const option = document.createElement("option")
+    option.value = ""
+    option.textContent = "无会话"
+    select.appendChild(option)
+    state.selectedSessionId = ""
+    return
+  }
+
+  sorted.forEach((session) => {
+    const option = document.createElement("option")
+    option.value = session.id
+    const endedText = session.endedAt ? "已结束" : "进行中"
+    option.textContent = `${session.id} (${endedText})`
+    select.appendChild(option)
   })
-  if (currentSessionId) sel.value = currentSessionId
-  sel.onchange = () => render(sel.value)
-  const viewSel = document.getElementById("viewSelect")
-  const { sidepanelView } = await getStorage(["sidepanelView"]) 
-  if (sidepanelView) {
-    viewSel.value = sidepanelView
+
+  const targetId = state.selectedSessionId
+    || currentSessionId
+    || sorted[0].id
+
+  if (sorted.some((item) => item.id === targetId)) {
+    select.value = targetId
+    state.selectedSessionId = targetId
   } else {
-    viewSel.value = "mindmap"
+    select.value = sorted[0].id
+    state.selectedSessionId = sorted[0].id
   }
-  viewSel.onchange = () => { chrome.storage.local.set({ sidepanelView: viewSel.value }); render(sel.value) }
-  await render(sel.value)
 }
 
-function buildIndex(nodes, edges) {
-  const byId = new Map(nodes.map(n => [n.id, n]))
-  const children = new Map()
-  edges.forEach(e => {
-    const list = children.get(e.fromNodeId) || []
-    list.push(e)
-    children.set(e.fromNodeId, list)
-  })
-  const parent = new Map()
-  edges.forEach(e => parent.set(e.toNodeId, e.fromNodeId))
-  return { byId, children, parent }
-}
+function guessRootId(nodes, edges, currentNodeId) {
+  const roots = nodes.filter((node) => node.isRoot)
+  if (!roots.length) return ""
 
-function renderRoots(container, nodes, edges) {
-  const { children } = buildIndex(nodes, edges)
-  container.innerHTML = ""
-  nodes.filter(n => n.isRoot).sort((a,b) => a.firstSeenAt - b.firstSeenAt).forEach(root => {
-    const div = document.createElement("div")
-    div.className = "root"
-    const title = document.createElement("div")
-    title.textContent = `${new URL(root.url).hostname} — ${root.title}`
-    div.appendChild(title)
-    const ul = document.createElement("ul")
-    function addChildren(nodeId, depth=0) {
-      if (depth >= 2) return
-      const es = children.get(nodeId) || []
-      es.forEach(e => {
-        const n = nodes.find(x => x.id === e.toNodeId)
-        const li = document.createElement("li")
-        const a = document.createElement("a")
-        a.href = n.url
-        a.textContent = `${new URL(n.url).hostname} — ${n.title}`
-        a.className = "url"
-        a.target = "_blank"
-        a.title = n.url
-        li.appendChild(a)
-        ul.appendChild(li)
-        addChildren(n.id, depth+1)
-      })
+  if (!currentNodeId) return roots[0].id
+
+  const parentByChild = new Map()
+  edges.forEach((edge) => {
+    if (!parentByChild.has(edge.toNodeId)) {
+      parentByChild.set(edge.toNodeId, edge.fromNodeId)
     }
-    addChildren(root.id, 0)
-    div.appendChild(ul)
-    container.appendChild(div)
   })
-}
 
-function renderTimeline(container, nodes, edges) {
-  container.innerHTML = ""
-  const events = []
-  nodes.filter(n => n.isRoot).forEach(n => {
-    events.push({ ts: n.firstSeenAt, type: "root", node: n, edge: null })
-  })
-  edges.forEach(e => {
-    const to = nodes.find(n => n.id === e.toNodeId)
-    events.push({ ts: e.createdAt, type: e.type, node: to, edge: e })
-  })
-  events.sort((a,b) => b.ts - a.ts)
-  const ul = document.createElement("ul")
-  events.slice(0, 200).forEach(ev => {
-    const li = document.createElement("li")
-    const a = document.createElement("a")
-    a.href = ev.node.url
-    a.textContent = `${new Date(ev.ts).toLocaleTimeString()} · ${new URL(ev.node.url).hostname} · ${ev.node.title}`
-    a.className = "url"
-    a.target = "_blank"
-    a.title = ev.node.url
-    li.appendChild(a)
-    ul.appendChild(li)
-  })
-  container.appendChild(ul)
-}
+  const byId = new Map(nodes.map((node) => [node.id, node]))
+  let cursor = byId.get(currentNodeId)
+  const seen = new Set()
 
-async function renderRadial(container, nodes, edges) {
-  container.innerHTML = ""
-  function measure(el){
-    let w = el.clientWidth || el.offsetWidth || (el.getBoundingClientRect().width || 600)
-    let h = el.clientHeight || el.offsetHeight || (el.getBoundingClientRect().height || 480)
-    w = Math.max(360, Math.floor(w))
-    h = Math.max(360, Math.floor(h))
-    return { w, h }
+  while (cursor && !seen.has(cursor.id)) {
+    seen.add(cursor.id)
+    if (cursor.isRoot) return cursor.id
+    cursor = byId.get(parentByChild.get(cursor.id))
   }
-  const { w: width, h: height } = measure(container)
-  const cx = width / 2, cy = height / 2
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg")
-  svg.setAttribute("viewBox", `0 0 ${width} ${height}`)
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet")
-  svg.style.width = "100%"
-  svg.style.height = "100%"
-  const gContent = document.createElementNS("http://www.w3.org/2000/svg", "g")
-  const httpNodes = nodes.filter(n => /^https?:/i.test(n.url))
-  const httpEdges = edges.filter(e => {
-    const a = httpNodes.find(n => n.id === e.fromNodeId)
-    const b = httpNodes.find(n => n.id === e.toNodeId)
-    return !!a && !!b
+
+  return roots[0].id
+}
+
+function populateRootSelect(nodes, edges, currentNodeId) {
+  const select = getEl("rootSelect")
+  const roots = nodes.filter((node) => node.isRoot).sort((a, b) => a.firstSeenAt - b.firstSeenAt)
+
+  select.innerHTML = ""
+
+  const autoOption = document.createElement("option")
+  autoOption.value = ""
+  autoOption.textContent = "自动根节点"
+  select.appendChild(autoOption)
+
+  roots.forEach((node) => {
+    const option = document.createElement("option")
+    option.value = node.id
+    option.textContent = `${hostOf(node.url)} · ${trunc(node.title, 18)}`
+    select.appendChild(option)
   })
-  const { children, parent } = buildIndex(httpNodes, httpEdges)
-  const roots = httpNodes.filter(n => n.isRoot).sort((a,b)=>a.firstSeenAt-b.firstSeenAt)
-  let root = roots[0] || httpNodes[0]
-  try {
-    const pref = await getStorage(["sidepanelRootId"]) 
-    if (pref.sidepanelRootId) {
-      const picked = httpNodes.find(n => n.id === pref.sidepanelRootId)
-      if (picked) root = picked
-    }
-  } catch {}
-  try {
-    const { activeTabId } = await getStorage(["activeTabId"]) 
-    if (activeTabId) {
-      const tab = await chrome.tabs.get(activeTabId)
-      const current = httpNodes.slice().reverse().find(n => n.url === tab.url)
-      if (current) {
-        let cur = current
-        while (cur && !cur.isRoot) {
-          const pId = parent.get(cur.id)
-          cur = httpNodes.find(n => n.id === pId)
+
+  const autoRootId = guessRootId(nodes, edges, currentNodeId)
+  if (state.selectedRootId && roots.some((root) => root.id === state.selectedRootId)) {
+    select.value = state.selectedRootId
+  } else {
+    select.value = ""
+    state.selectedRootId = autoRootId
+  }
+}
+
+function buildGraph(nodes, edges, rootId, currentNodeId, searchText) {
+  const nodeById = new Map(nodes.map((node) => [node.id, { ...node }]))
+  const validEdges = edges.filter((edge) => nodeById.has(edge.fromNodeId) && nodeById.has(edge.toNodeId))
+
+  let pickedRootId = rootId
+  if (!pickedRootId || !nodeById.has(pickedRootId)) {
+    pickedRootId = guessRootId(nodes, validEdges, currentNodeId)
+  }
+
+  let visibleIds = new Set(nodeById.keys())
+  if (pickedRootId && nodeById.has(pickedRootId)) {
+    visibleIds = new Set([pickedRootId])
+    const queue = [pickedRootId]
+    while (queue.length) {
+      const fromId = queue.shift()
+      validEdges.forEach((edge) => {
+        if (edge.fromNodeId !== fromId) return
+        if (!visibleIds.has(edge.toNodeId)) {
+          visibleIds.add(edge.toNodeId)
+          queue.push(edge.toNodeId)
         }
-        if (cur) root = cur
-      }
-    }
-  } catch (e) {}
-  if (!root) { container.textContent = "暂无数据"; return }
-  const maxDepth = 3
-  const levelNodes = []
-  levelNodes[0] = [root]
-  const seen = new Set([root.id])
-  const usedEdgePairs = []
-  for (let d=1; d<=maxDepth; d++) {
-    const prev = levelNodes[d-1] || []
-    const next = []
-    prev.forEach(p => {
-      const es = children.get(p.id) || []
-      es.forEach(e => {
-        const n = httpNodes.find(x => x.id === e.toNodeId)
-        if (n && !seen.has(n.id)) { seen.add(n.id); next.push(n); usedEdgePairs.push({ from: p.id, to: n.id }) }
       })
-    })
-    levelNodes[d] = next.slice(0, 40)
-  }
-  const maxR = Math.min(cx, cy) - 60
-  const radiusBase = Math.max(40, Math.floor(maxR / (maxDepth + 1)))
-  const radiusStep = Math.max(60, Math.floor((maxR - radiusBase) / Math.max(1, maxDepth)))
-  const pos = new Map()
-  levelNodes.forEach((arr, d) => {
-    let r = Math.min(maxR, radiusBase + d * radiusStep)
-    const count = Math.max(arr.length, 1)
-    if (count > 10) r = Math.min(maxR, r * 1.2)
-    const base = Math.random() * Math.PI * 2
-    const step = (Math.PI * 2) / count
-    arr.forEach((n, i) => {
-      const angle = base + step * i
-      const x = cx + r * Math.cos(angle)
-      const y = cy + r * Math.sin(angle)
-      pos.set(n.id, { x, y })
-    })
-  })
-  usedEdgePairs.forEach(e => {
-    const a = pos.get(e.from)
-    const b = pos.get(e.to)
-    if (!a || !b) return
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "line")
-    line.setAttribute("x1", String(a.x))
-    line.setAttribute("y1", String(a.y))
-    line.setAttribute("x2", String(b.x))
-    line.setAttribute("y2", String(b.y))
-    line.setAttribute("stroke", "#ddd")
-    line.setAttribute("stroke-width", "1")
-    gContent.appendChild(line)
-  })
-  const formatTitle = t => (t || "").slice(0, 14)
-  const host = u => { try { return new URL(u).hostname } catch { return u } }
-  levelNodes.flat().forEach(n => {
-    const p = pos.get(n.id)
-    if (!p) return
-    const group = document.createElementNS("http://www.w3.org/2000/svg", "g")
-    const link = document.createElementNS("http://www.w3.org/2000/svg", "a")
-    link.setAttribute("href", n.url)
-    link.setAttribute("target", "_blank")
-    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle")
-    circle.setAttribute("cx", String(p.x))
-    circle.setAttribute("cy", String(p.y))
-    circle.setAttribute("r", "8")
-    circle.setAttribute("fill", n.id === root.id ? "#0070f3" : "#666")
-    const text = document.createElementNS("http://www.w3.org/2000/svg", "text")
-    text.setAttribute("x", String(p.x + 12))
-    text.setAttribute("y", String(p.y + 4))
-    text.setAttribute("font-size", "12")
-    text.setAttribute("fill", "#333")
-    text.textContent = `${host(n.url)} · ${formatTitle(n.title)}`
-    text.setAttribute("dominant-baseline", "middle")
-    text.setAttribute("textLength", String(Math.min(240, Math.max(60, width - p.x - 24))))
-    link.appendChild(circle)
-    group.appendChild(link)
-    group.appendChild(text)
-    gContent.appendChild(group)
-  })
-  const total = levelNodes.flat().length
-  if (total <= 1) {
-    const msg = document.createElement("div")
-    msg.style.color = "#666"
-    msg.style.fontSize = "12px"
-    msg.textContent = "当前根下暂无子节点，继续浏览或切换视图查看。"
-    container.appendChild(msg)
-    svg.appendChild(gContent)
-    container.appendChild(svg)
-    return
-  }
-  svg.appendChild(gContent)
-  const ctrl = enablePanZoom(svg, gContent, width, height)
-  attachControls(ctrl, svg, gContent)
-  container.appendChild(svg)
-}
-
-function enablePanZoom(svg, g, w, h) {
-  let scale = 1
-  let tx = 0, ty = 0
-  const clamp = (v, min, max) => Math.min(max, Math.max(min, v))
-  function apply() { g.setAttribute("transform", `translate(${tx},${ty}) scale(${scale})`) }
-  svg.addEventListener("wheel", e => {
-    e.preventDefault()
-    const rect = svg.getBoundingClientRect()
-    const mx = e.clientX - rect.left
-    const my = e.clientY - rect.top
-    const preX = (mx - tx) / scale
-    const preY = (my - ty) / scale
-    const delta = e.deltaY > 0 ? 0.9 : 1.1
-    scale = clamp(scale * delta, 0.5, 3)
-    tx = mx - preX * scale
-    ty = my - preY * scale
-    apply()
-  }, { passive: false })
-  let dragging = false, sx = 0, sy = 0
-  svg.addEventListener("mousedown", e => { dragging = true; sx = e.clientX; sy = e.clientY })
-  window.addEventListener("mouseup", () => { dragging = false })
-  window.addEventListener("mousemove", e => { if (!dragging) return; tx += (e.clientX - sx); ty += (e.clientY - sy); sx = e.clientX; sy = e.clientY; apply() })
-  apply()
-  function fit() {
-    try {
-      const box = g.getBBox()
-      const margin = 20
-      const vw = svg.clientWidth || w
-      const vh = svg.clientHeight || h
-      const sx = (vw - margin * 2) / box.width
-      const sy = (vh - margin * 2) / box.height
-      scale = clamp(Math.min(sx, sy), 0.3, 4)
-      tx = margin - box.x * scale
-      ty = margin - box.y * scale
-      apply()
-    } catch {}
-  }
-  function zoomIn() { scale = clamp(scale * 1.2, 0.5, 4); apply() }
-  function zoomOut() { scale = clamp(scale / 1.2, 0.5, 4); apply() }
-  function centerRoot() {
-    try {
-      const circles = g.querySelectorAll('circle')
-      const rootCircle = circles[0]
-      if (!rootCircle) return
-      const cx = parseFloat(rootCircle.getAttribute('cx'))
-      const cy = parseFloat(rootCircle.getAttribute('cy'))
-      const vw = svg.clientWidth || w
-      const vh = svg.clientHeight || h
-      tx = vw / 2 - cx * scale
-      ty = vh / 2 - cy * scale
-      apply()
-    } catch {}
-  }
-  return { fit, zoomIn, zoomOut, centerRoot }
-}
-
-function attachControls(ctrl, svg, g) {
-  const btnFit = document.getElementById('btnFit')
-  const btnCenter = document.getElementById('btnCenter')
-  const btnZoomIn = document.getElementById('btnZoomIn')
-  const btnZoomOut = document.getElementById('btnZoomOut')
-  if (btnFit) btnFit.onclick = () => ctrl.fit()
-  if (btnCenter) btnCenter.onclick = () => ctrl.centerRoot()
-  if (btnZoomIn) btnZoomIn.onclick = () => ctrl.zoomIn()
-  if (btnZoomOut) btnZoomOut.onclick = () => ctrl.zoomOut()
-  // 首次渲染自适配
-  setTimeout(() => ctrl.fit(), 0)
-}
-
-async function renderMindmap(container, nodes, edges) {
-  container.innerHTML = ""
-  function measure(el){
-    let w = el.clientWidth || el.offsetWidth || (el.getBoundingClientRect().width || 800)
-    let h = el.clientHeight || el.offsetHeight || (el.getBoundingClientRect().height || 600)
-    w = Math.max(480, Math.floor(w))
-    h = Math.max(360, Math.floor(h))
-    return { w, h }
-  }
-  const { w: width, h: height } = measure(container)
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg")
-  svg.setAttribute("viewBox", `0 0 ${width} ${height}`)
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet")
-  svg.style.width = "100%"
-  svg.style.height = "100%"
-  const gContent = document.createElementNS("http://www.w3.org/2000/svg", "g")
-  const httpNodes = nodes.filter(n => /^https?:/i.test(n.url))
-  const nodeById = new Map(httpNodes.map(n => [n.id, n]))
-  const parent = new Map()
-  edges.forEach(e => { if (nodeById.has(e.fromNodeId) && nodeById.has(e.toNodeId)) parent.set(e.toNodeId, e.fromNodeId) })
-  const children = new Map()
-  edges.forEach(e => { if (!nodeById.has(e.fromNodeId) || !nodeById.has(e.toNodeId)) return; const list = children.get(e.fromNodeId) || []; list.push(e.toNodeId); children.set(e.fromNodeId, list) })
-  let roots = httpNodes.filter(n => n.isRoot)
-  let root = roots.sort((a,b)=>a.firstSeenAt-b.firstSeenAt)[0] || httpNodes[0]
-  try {
-    const pref = await getStorage(["sidepanelRootId"]) 
-    if (pref.sidepanelRootId) {
-      const picked = httpNodes.find(n => n.id === pref.sidepanelRootId)
-      if (picked) root = picked
     }
-  } catch {}
-  try {
-    const { activeTabId } = await getStorage(["activeTabId"]) 
-    if (activeTabId) {
-      const tab = await chrome.tabs.get(activeTabId)
-      const current = httpNodes.slice().reverse().find(n => n.url === tab.url)
-      if (current) {
-        let cur = current
-        while (cur && !cur.isRoot) { const pId = parent.get(cur.id); cur = nodeById.get(pId) }
-        if (cur) root = cur
+  }
+
+  let filteredEdges = validEdges.filter((edge) => visibleIds.has(edge.fromNodeId) && visibleIds.has(edge.toNodeId))
+  let filteredNodes = [...visibleIds].map((id) => nodeById.get(id)).filter(Boolean)
+
+  const query = String(searchText || "").trim().toLowerCase()
+  if (query) {
+    const matched = new Set(
+      filteredNodes
+        .filter((node) => (
+          node.title.toLowerCase().includes(query)
+          || node.url.toLowerCase().includes(query)
+        ))
+        .map((node) => node.id)
+    )
+
+    const keep = new Set(matched)
+
+    // 保留匹配节点的上下文，避免孤立节点。
+    let changed = true
+    while (changed) {
+      changed = false
+      filteredEdges.forEach((edge) => {
+        if (keep.has(edge.fromNodeId) && !keep.has(edge.toNodeId)) {
+          keep.add(edge.toNodeId)
+          changed = true
+        }
+        if (keep.has(edge.toNodeId) && !keep.has(edge.fromNodeId)) {
+          keep.add(edge.fromNodeId)
+          changed = true
+        }
+      })
+    }
+
+    filteredNodes = filteredNodes.filter((node) => keep.has(node.id))
+    filteredEdges = filteredEdges.filter((edge) => keep.has(edge.fromNodeId) && keep.has(edge.toNodeId))
+  }
+
+  const graphNodeById = new Map(filteredNodes.map((node) => [node.id, node]))
+  const outEdges = new Map()
+  filteredEdges.forEach((edge) => {
+    const list = outEdges.get(edge.fromNodeId) || []
+    list.push(edge)
+    outEdges.set(edge.fromNodeId, list)
+  })
+
+  const depthByNode = new Map()
+  if (pickedRootId && graphNodeById.has(pickedRootId)) {
+    depthByNode.set(pickedRootId, 0)
+    const queue = [pickedRootId]
+    while (queue.length) {
+      const id = queue.shift()
+      const depth = depthByNode.get(id)
+      const outgoing = outEdges.get(id) || []
+      outgoing.forEach((edge) => {
+        if (!depthByNode.has(edge.toNodeId)) {
+          depthByNode.set(edge.toNodeId, depth + 1)
+          queue.push(edge.toNodeId)
+        }
+      })
+    }
+  }
+
+  const preparedNodes = filteredNodes.map((node) => {
+    const depth = depthByNode.has(node.id) ? depthByNode.get(node.id) : 1
+    const radius = node.id === currentNodeId ? 17 : (node.id === pickedRootId ? 15 : 12)
+    return {
+      ...node,
+      depth,
+      radius,
+      x: 0,
+      y: 0,
+      vx: 0,
+      vy: 0,
+      isCurrent: node.id === currentNodeId,
+      isPickedRoot: node.id === pickedRootId
+    }
+  })
+
+  return {
+    rootId: pickedRootId,
+    nodes: preparedNodes,
+    edges: filteredEdges
+  }
+}
+
+function initNodePositions(graph) {
+  if (!graph.nodes.length) return
+
+  const byDepth = new Map()
+  graph.nodes.forEach((node) => {
+    const list = byDepth.get(node.depth) || []
+    list.push(node)
+    byDepth.set(node.depth, list)
+  })
+
+  const root = graph.nodes.find((node) => node.id === graph.rootId) || graph.nodes[0]
+  root.x = 0
+  root.y = 0
+
+  const maxDepth = Math.max(...graph.nodes.map((node) => node.depth))
+  for (let depth = 1; depth <= maxDepth; depth += 1) {
+    const layer = byDepth.get(depth) || []
+    if (!layer.length) continue
+    const radius = 120 + depth * 130
+    const step = (Math.PI * 2) / layer.length
+    const offset = (depth % 2) * 0.4
+    layer.forEach((node, index) => {
+      const angle = offset + step * index
+      node.x = Math.cos(angle) * radius
+      node.y = Math.sin(angle) * radius
+    })
+  }
+}
+
+function runForceLayout(graph) {
+  const nodes = graph.nodes
+  const edges = graph.edges
+  if (!nodes.length) return
+
+  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const root = nodes.find((node) => node.id === graph.rootId) || nodes[0]
+  const iterations = nodes.length > 220 ? 120 : 220
+
+  for (let tick = 0; tick < iterations; tick += 1) {
+    for (let i = 0; i < nodes.length; i += 1) {
+      const a = nodes[i]
+      for (let j = i + 1; j < nodes.length; j += 1) {
+        const b = nodes[j]
+        let dx = a.x - b.x
+        let dy = a.y - b.y
+        let distSq = dx * dx + dy * dy
+        if (distSq < 0.1) {
+          dx = (Math.random() - 0.5) * 2
+          dy = (Math.random() - 0.5) * 2
+          distSq = dx * dx + dy * dy
+        }
+
+        const minDist = a.radius + b.radius + 24
+        if (distSq > (minDist * minDist) * 6) continue
+
+        const dist = Math.sqrt(distSq)
+        const repel = 900 / distSq
+        const ux = dx / dist
+        const uy = dy / dist
+        a.vx += ux * repel
+        a.vy += uy * repel
+        b.vx -= ux * repel
+        b.vy -= uy * repel
+
+        if (dist < minDist) {
+          const overlap = (minDist - dist) * 0.02
+          a.vx += ux * overlap
+          a.vy += uy * overlap
+          b.vx -= ux * overlap
+          b.vy -= uy * overlap
+        }
       }
     }
-  } catch {}
-  if (!root) { container.textContent = "暂无数据"; return }
-  const maxDepth = 4
-  const levelNodes = []
-  levelNodes[0] = [root]
-  const seen = new Set([root.id])
-  const usedEdgePairs = []
-  for (let d=1; d<=maxDepth; d++) {
-    const prev = levelNodes[d-1] || []
-    const next = []
-    prev.forEach(p => {
-      const list = (children.get(p.id) || []).map(id => nodeById.get(id)).filter(Boolean)
-      list.forEach(n => { if (!seen.has(n.id)) { seen.add(n.id); next.push(n); usedEdgePairs.push({ from: p.id, to: n.id }) } })
+
+    edges.forEach((edge) => {
+      const from = nodeById.get(edge.fromNodeId)
+      const to = nodeById.get(edge.toNodeId)
+      if (!from || !to) return
+
+      const dx = to.x - from.x
+      const dy = to.y - from.y
+      const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy))
+      const target = 110 + Math.abs((to.depth || 1) - (from.depth || 1)) * 34
+      const spring = (dist - target) * 0.004
+      const ux = dx / dist
+      const uy = dy / dist
+
+      from.vx += ux * spring
+      from.vy += uy * spring
+      to.vx -= ux * spring
+      to.vy -= uy * spring
     })
-    levelNodes[d] = next.slice(0, 24)
+
+    nodes.forEach((node) => {
+      if (node.id === root.id) {
+        node.vx += (0 - node.x) * 0.02
+        node.vy += (0 - node.y) * 0.02
+      } else {
+        const depth = Math.max(1, node.depth || 1)
+        const targetRadius = 120 + depth * 130
+        const dist = Math.max(1, Math.sqrt(node.x * node.x + node.y * node.y))
+        const radial = (targetRadius - dist) * 0.0015
+        node.vx += (node.x / dist) * radial
+        node.vy += (node.y / dist) * radial
+      }
+
+      node.vx *= 0.86
+      node.vy *= 0.86
+      node.x += node.vx
+      node.y += node.vy
+
+      node.x = Math.max(-2400, Math.min(2400, node.x))
+      node.y = Math.max(-2400, Math.min(2400, node.y))
+    })
   }
-  const margin = { left: 40, right: 40, top: 40, bottom: 40 }
-  const layers = levelNodes.map((arr, d) => ({ arr, x: margin.left + d * ((width - margin.left - margin.right) / Math.max(1, maxDepth)) }))
-  const pos = new Map()
-  layers.forEach(({ arr, x }, d) => {
-    const gap = (height - margin.top - margin.bottom) / Math.max(arr.length, 1)
-    arr.forEach((n, i) => { const y = margin.top + gap * (i + 0.5); pos.set(n.id, { x, y }) })
-  })
-  function path(a, b){ const mx = (a.x + b.x) / 2; return `M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}` }
-  const gLinks = document.createElementNS("http://www.w3.org/2000/svg", "g")
-  gLinks.setAttribute("stroke", "#ddd"); gLinks.setAttribute("fill", "none")
-  usedEdgePairs.forEach(e => { const a = pos.get(e.from); const b = pos.get(e.to); if (!a || !b) return; const p = document.createElementNS("http://www.w3.org/2000/svg", "path"); p.setAttribute("d", path(a,b)); p.setAttribute("stroke-width", "1"); gLinks.appendChild(p) })
-  gContent.appendChild(gLinks)
-  const gNodes = document.createElementNS("http://www.w3.org/2000/svg", "g")
-  function host(u){ try { return new URL(u).hostname } catch { return u } }
-  function wrap(text, max){ const t = (text||"").trim(); if (t.length <= max) return [t]; const lines = []; let i = 0; while (i < t.length) { lines.push(t.slice(i, i+max)); i += max } return lines }
-  const labelMax = 22
-  levelNodes.flat().forEach(n => {
-    const p = pos.get(n.id); if (!p) return
-    const link = document.createElementNS("http://www.w3.org/2000/svg", "a"); link.setAttribute("href", n.url); link.setAttribute("target", "_blank")
-    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle"); circle.setAttribute("cx", String(p.x)); circle.setAttribute("cy", String(p.y)); circle.setAttribute("r", String(n.id===root.id?6:4)); circle.setAttribute("fill", n.id===root.id?"#0070f3":"#666")
-    link.appendChild(circle)
-    const text = document.createElementNS("http://www.w3.org/2000/svg", "text"); text.setAttribute("x", String(p.x + 10)); text.setAttribute("y", String(p.y)); text.setAttribute("font-size", "12"); text.setAttribute("fill", "#333"); text.setAttribute("dominant-baseline", "middle")
-    const lines = [`${host(n.url)}`, ...wrap(n.title, labelMax)]
-    lines.forEach((line, i) => { const tspan = document.createElementNS("http://www.w3.org/2000/svg", "tspan"); tspan.setAttribute("x", String(p.x + 10)); tspan.setAttribute("dy", String(i===0?0:14)); tspan.textContent = line; text.appendChild(tspan) })
-    gNodes.appendChild(link); gNodes.appendChild(text)
-  })
-  gContent.appendChild(gNodes)
-  if (levelNodes.flat().length <= 1) { const msg = document.createElement("div"); msg.style.color = "#666"; msg.style.fontSize = "12px"; msg.textContent = "当前根下暂无子节点，继续浏览或切换视图查看。"; container.appendChild(msg) }
-  svg.appendChild(gContent)
-  const ctrl = enablePanZoom(svg, gContent, width, height)
-  attachControls(ctrl, svg, gContent)
-  container.appendChild(svg)
+
+  root.x = 0
+  root.y = 0
 }
 
-async function renderBreadcrumb(currentSessionId, nodes, edges) {
-  const div = document.getElementById("breadcrumb")
-  const { activeTabId } = await getStorage(["activeTabId"]) 
-  if (!activeTabId) { div.textContent = ""; return }
-  const currentUrl = (await chrome.tabs.get(activeTabId)).url
-  const currentNode = nodes.slice().reverse().find(n => n.url === currentUrl)
-  if (!currentNode) { div.textContent = ""; return }
-  const path = []
-  let node = currentNode
-  const parentsByChild = new Map()
-  edges.forEach(e => parentsByChild.set(e.toNodeId, e.fromNodeId))
-  while (node) {
-    path.push(node)
-    const pId = parentsByChild.get(node.id)
-    node = nodes.find(n => n.id === pId)
-  }
-  path.reverse()
-  div.textContent = path.map(n => new URL(n.url).hostname).join(" › ")
+function applyTransform() {
+  const viewport = getEl("viewport")
+  const t = state.transform
+  viewport.setAttribute("transform", `translate(${t.x}, ${t.y}) scale(${t.scale})`)
 }
 
-async function render(sessionId) {
-  if (!sessionId) {
-    const roots = document.getElementById("roots")
-    roots.innerHTML = "尚未开始记录，请在弹窗中新建会话或恢复记录。"
-    document.getElementById("breadcrumb").textContent = ""
+function fitGraphToViewport() {
+  if (!state.graph || !state.graph.nodes.length) return
+  const { width, height } = svgSize()
+
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+
+  state.graph.nodes.forEach((node) => {
+    minX = Math.min(minX, node.x - node.radius)
+    maxX = Math.max(maxX, node.x + node.radius)
+    minY = Math.min(minY, node.y - node.radius)
+    maxY = Math.max(maxY, node.y + node.radius)
+  })
+
+  const graphWidth = Math.max(1, maxX - minX)
+  const graphHeight = Math.max(1, maxY - minY)
+  const margin = 60
+  const scale = Math.max(0.2, Math.min(1.8, Math.min(
+    (width - margin) / graphWidth,
+    (height - margin) / graphHeight
+  )))
+
+  state.transform.scale = scale
+  state.transform.x = width / 2 - ((minX + maxX) / 2) * scale
+  state.transform.y = height / 2 - ((minY + maxY) / 2) * scale
+  applyTransform()
+}
+
+function worldPoint(clientX, clientY) {
+  const svg = getEl("graphSvg")
+  const rect = svg.getBoundingClientRect()
+  const x = (clientX - rect.left - state.transform.x) / state.transform.scale
+  const y = (clientY - rect.top - state.transform.y) / state.transform.scale
+  return { x, y }
+}
+
+function updateGeometry() {
+  const nodeById = state.renderCache.nodeById
+
+  state.renderCache.edgeEls.forEach(({ edge, el }) => {
+    const from = nodeById.get(edge.fromNodeId)
+    const to = nodeById.get(edge.toNodeId)
+    if (!from || !to) return
+
+    const dx = to.x - from.x
+    const dy = to.y - from.y
+    const bend = Math.min(70, Math.max(-70, (Math.abs(dx) + Math.abs(dy)) * 0.08))
+    const mx = (from.x + to.x) / 2
+    const my = (from.y + to.y) / 2 - bend
+    el.setAttribute("d", `M ${from.x} ${from.y} Q ${mx} ${my} ${to.x} ${to.y}`)
+  })
+
+  state.renderCache.nodeEls.forEach(({ node, el }) => {
+    el.setAttribute("transform", `translate(${node.x}, ${node.y})`)
+  })
+}
+
+function renderGraph() {
+  const graph = state.graph
+  const edgeLayer = getEl("edgeLayer")
+  const nodeLayer = getEl("nodeLayer")
+  const empty = getEl("empty")
+
+  edgeLayer.innerHTML = ""
+  nodeLayer.innerHTML = ""
+  state.renderCache.nodeById = new Map()
+  state.renderCache.edgeEls = []
+  state.renderCache.nodeEls = []
+
+  if (!graph || !graph.nodes.length) {
+    empty.style.display = "flex"
     return
   }
-  const data = await getStorage([sessionKey(sessionId), nodesKey(sessionId), edgesKey(sessionId)])
-  const nodes = data[nodesKey(sessionId)] || []
-  const edges = data[edgesKey(sessionId)] || []
-  const groupChk = document.getElementById("groupByDomain")
-  const grouped = groupChk && groupChk.checked
-  const source = grouped ? aggregateByDomain(nodes, edges) : { nodes, edges }
-  const rootSelect = document.getElementById("rootSelect")
-  if (rootSelect) {
-    rootSelect.innerHTML = ""
-    const rootsList = nodes.filter(n => n.isRoot).sort((a,b)=>a.firstSeenAt-b.firstSeenAt)
-    rootsList.forEach(r => {
-      const opt = document.createElement("option")
-      try { opt.textContent = new URL(r.url).hostname } catch { opt.textContent = r.url }
-      opt.value = r.id
-      rootSelect.appendChild(opt)
+
+  empty.style.display = "none"
+
+  graph.nodes.forEach((node) => state.renderCache.nodeById.set(node.id, node))
+
+  graph.edges.forEach((edge) => {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path")
+    path.classList.add("edge")
+    path.setAttribute("stroke", EDGE_COLORS[edge.type] || EDGE_COLORS.default)
+    edgeLayer.appendChild(path)
+    state.renderCache.edgeEls.push({ edge, el: path })
+  })
+
+  graph.nodes.forEach((node) => {
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g")
+    g.classList.add("node")
+    if (node.isPickedRoot) g.classList.add("root")
+    if (node.isCurrent) g.classList.add("current")
+    g.dataset.nodeId = node.id
+
+    const halo = document.createElementNS("http://www.w3.org/2000/svg", "circle")
+    halo.classList.add("halo")
+    halo.setAttribute("r", String(node.radius + 7))
+
+    const base = document.createElementNS("http://www.w3.org/2000/svg", "circle")
+    base.classList.add("base")
+    base.setAttribute("r", String(node.radius))
+
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text")
+    label.setAttribute("x", String(node.radius + 6))
+    label.setAttribute("y", "4")
+    const labelText = `${hostOf(node.url)} · ${trunc(node.title, 16)}`
+    label.textContent = labelText
+
+    const tooltip = document.createElementNS("http://www.w3.org/2000/svg", "title")
+    tooltip.textContent = [
+      `标题: ${node.title || "-"}`,
+      `URL: ${node.url || "-"}`,
+      `首次访问: ${formatTime(node.firstSeenAt)}`,
+      `最后访问: ${formatTime(node.lastSeenAt)}`,
+      `访问次数: ${node.visitCount}`
+    ].join("\n")
+
+    g.appendChild(halo)
+    g.appendChild(base)
+    g.appendChild(label)
+    g.appendChild(tooltip)
+
+    g.addEventListener("dblclick", (event) => {
+      event.stopPropagation()
+      chrome.tabs.create({ url: node.url })
     })
-    const pref = await getStorage(["sidepanelRootId"]) 
-    if (pref.sidepanelRootId && rootsList.some(r => r.id === pref.sidepanelRootId)) rootSelect.value = pref.sidepanelRootId
-    rootSelect.onchange = async () => { await chrome.storage.local.set({ sidepanelRootId: rootSelect.value }); await render(sessionId) }
-  }
-  const viewSel = document.getElementById("viewSelect")
-  if (!nodes.length) {
-    const roots = document.getElementById("roots")
-    roots.innerHTML = "当前会话暂无记录，开始浏览或在弹窗中确认状态为记录中。"
+
+    nodeLayer.appendChild(g)
+    state.renderCache.nodeEls.push({ node, el: g })
+  })
+
+  updateGeometry()
+
+  if (state.autoFit) {
+    fitGraphToViewport()
   } else {
-    if (viewSel.value === "timeline") {
-      renderTimeline(document.getElementById("roots"), source.nodes, source.edges)
-    } else if (viewSel.value === "radial") {
-      await renderRadial(document.getElementById("roots"), source.nodes, source.edges)
-    } else if (viewSel.value === "mindmap") {
-      await renderMindmap(document.getElementById("roots"), source.nodes, source.edges)
-    } else {
-      renderRoots(document.getElementById("roots"), source.nodes, source.edges)
-    }
+    applyTransform()
   }
-  await renderBreadcrumb(sessionId, nodes, edges)
 }
 
-chrome.runtime.sendMessage({ type: "ensure-session" }, async () => {
-  await loadSessions()
-})
-let renderTimer = null
-chrome.storage.onChanged.addListener(async (changes, area) => {
-  if (area !== "local") return
-  const sel = document.getElementById("sessionSelect")
-  const current = sel.value
-  const relevantKeys = new Set(["sessions", "currentSessionId", "sidepanelView", sessionKey(current), nodesKey(current), edgesKey(current)])
-  const hasRelevant = Object.keys(changes).some(k => relevantKeys.has(k))
-  if (hasRelevant) {
-    if (renderTimer) clearTimeout(renderTimer)
-    renderTimer = setTimeout(async () => {
-      await loadSessions()
-    }, 400)
+function renderBreadcrumb() {
+  const el = getEl("breadcrumb")
+  const graph = state.graph
+  if (!graph || !graph.nodes.length) {
+    el.textContent = ""
+    return
   }
-})
-function aggregateByDomain(nodes, edges) {
-  const hn = u => { try { return new URL(u).hostname } catch { return u } }
-  const map = new Map()
-  nodes.forEach(n => {
-    const d = hn(n.url)
-    const id = `d:${d}`
-    if (!map.has(d)) map.set(d, { id, url: `https://${d}/`, title: d, isRoot: false, firstSeenAt: n.firstSeenAt })
-    if (n.isRoot) map.get(d).isRoot = true
-  })
-  const aggNodes = Array.from(map.values())
-  const uniq = new Set()
-  const aggEdges = []
-  edges.forEach(e => {
-    const from = nodes.find(x => x.id === e.fromNodeId)
-    const to = nodes.find(x => x.id === e.toNodeId)
-    if (!from || !to) return
-    const df = hn(from.url), dt = hn(to.url)
-    const k = `${df}=>${dt}`
-    if (df === dt) return
-    if (uniq.has(k)) return
-    uniq.add(k)
-    aggEdges.push({ id: `de:${k}`, fromNodeId: `d:${df}`, toNodeId: `d:${dt}`, type: "domain" })
-  })
-  return { nodes: aggNodes, edges: aggEdges }
+
+  const current = graph.nodes.find((node) => node.isCurrent)
+  const rootId = graph.rootId
+  if (!current || !rootId) {
+    el.textContent = "当前页未落在可视化子树中"
+    return
+  }
+
+  if (current.id === rootId) {
+    el.textContent = `${hostOf(current.url)} (当前根节点)`
+    return
+  }
+
+  const parent = new Map()
+  const queue = [rootId]
+  const visited = new Set([rootId])
+
+  while (queue.length) {
+    const fromId = queue.shift()
+    graph.edges.forEach((edge) => {
+      if (edge.fromNodeId !== fromId) return
+      if (visited.has(edge.toNodeId)) return
+      visited.add(edge.toNodeId)
+      parent.set(edge.toNodeId, edge.fromNodeId)
+      queue.push(edge.toNodeId)
+    })
+  }
+
+  if (!visited.has(current.id)) {
+    el.textContent = `${hostOf(current.url)} (当前页不在所选树根下)`
+    return
+  }
+
+  const path = []
+  let cursor = current.id
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]))
+
+  while (cursor) {
+    const node = byId.get(cursor)
+    if (!node) break
+    path.push(node)
+    if (cursor === rootId) break
+    cursor = parent.get(cursor)
+  }
+
+  path.reverse()
+  el.innerHTML = path.map((node) => escapeHtml(hostOf(node.url))).join(" &rsaquo; ")
 }
+
+function renderStats() {
+  const statsText = getEl("statsText")
+  if (!state.sessionData) {
+    statsText.textContent = "无会话数据"
+    return
+  }
+
+  const totalNodes = state.sessionData.nodes.length
+  const totalEdges = state.sessionData.edges.length
+  const shownNodes = state.graph ? state.graph.nodes.length : 0
+  const shownEdges = state.graph ? state.graph.edges.length : 0
+  statsText.textContent = `总节点 ${totalNodes} / 展示 ${shownNodes} · 总边 ${totalEdges} / 展示 ${shownEdges}`
+}
+
+function updatePauseUI() {
+  const paused = state.settings && state.settings.isPaused
+  const tag = getEl("pausedTag")
+  const btn = getEl("btnPause")
+
+  tag.textContent = paused ? "已暂停" : "记录中"
+  tag.style.background = paused ? "#fef3c7" : "#dff6f3"
+  tag.style.color = paused ? "#92400e" : "#0f766e"
+
+  btn.textContent = paused ? "恢复" : "暂停"
+}
+
+function rebuildGraph() {
+  if (!state.sessionData) {
+    state.graph = null
+    renderGraph()
+    renderBreadcrumb()
+    renderStats()
+    return
+  }
+
+  const rootSelectValue = getEl("rootSelect").value
+  const selectedRootId = rootSelectValue || state.selectedRootId || ""
+
+  state.graph = buildGraph(
+    state.sessionData.nodes,
+    state.sessionData.edges,
+    selectedRootId,
+    state.sessionData.currentNodeId,
+    state.searchText
+  )
+
+  initNodePositions(state.graph)
+  runForceLayout(state.graph)
+  renderGraph()
+  renderBreadcrumb()
+  renderStats()
+}
+
+async function loadSessionData(sessionId) {
+  if (!sessionId) {
+    state.sessionData = { nodes: [], edges: [], currentNodeId: null }
+    return
+  }
+
+  const response = await callBg("get-session-data", { sessionId })
+  state.sessionData = {
+    sessionId: response.sessionId,
+    session: response.session,
+    nodes: response.nodes || [],
+    edges: response.edges || [],
+    currentNodeId: response.currentNodeId || null
+  }
+}
+
+async function refreshAll() {
+  const dashboard = await callBg("get-dashboard")
+  state.dashboard = dashboard
+  state.settings = dashboard.settings
+
+  populateSessionSelect(dashboard.sessions || [], dashboard.currentSessionId)
+  updatePauseUI()
+
+  await loadSessionData(state.selectedSessionId)
+  populateRootSelect(state.sessionData.nodes, state.sessionData.edges, state.sessionData.currentNodeId)
+
+  state.autoFit = true
+  rebuildGraph()
+}
+
+function downloadJson(filename, data) {
+  const content = JSON.stringify(data, null, 2)
+  const blob = new Blob([content], { type: "application/json" })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement("a")
+  link.href = url
+  link.download = filename
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+async function onExport() {
+  if (!state.selectedSessionId) return
+  const response = await callBg("export-session", { sessionId: state.selectedSessionId })
+  downloadJson(`${state.selectedSessionId}.json`, response.data)
+}
+
+async function onTogglePause() {
+  const paused = state.settings && state.settings.isPaused
+  const response = await callBg("set-paused", { isPaused: !paused })
+  state.settings = response.settings
+  updatePauseUI()
+}
+
+async function onNewSession() {
+  await callBg("start-new-session")
+  state.selectedRootId = ""
+  await refreshAll()
+}
+
+function bindControls() {
+  getEl("sessionSelect").addEventListener("change", async (event) => {
+    state.selectedSessionId = event.target.value
+    state.selectedRootId = ""
+    await loadSessionData(state.selectedSessionId)
+    populateRootSelect(state.sessionData.nodes, state.sessionData.edges, state.sessionData.currentNodeId)
+    state.autoFit = true
+    rebuildGraph()
+  })
+
+  getEl("rootSelect").addEventListener("change", (event) => {
+    state.selectedRootId = event.target.value || state.selectedRootId
+    state.autoFit = true
+    rebuildGraph()
+  })
+
+  const debouncedSearch = debounce((value) => {
+    state.searchText = value
+    state.autoFit = true
+    rebuildGraph()
+  }, 220)
+
+  getEl("searchInput").addEventListener("input", (event) => {
+    debouncedSearch(event.target.value || "")
+  })
+
+  getEl("btnRefresh").addEventListener("click", async () => {
+    await refreshAll()
+  })
+
+  getEl("btnPause").addEventListener("click", async () => {
+    await onTogglePause()
+  })
+
+  getEl("btnNewSession").addEventListener("click", async () => {
+    await onNewSession()
+  })
+
+  getEl("btnExport").addEventListener("click", async () => {
+    await onExport()
+  })
+}
+
+function bindCanvasInteractions() {
+  const svg = getEl("graphSvg")
+
+  function startPan(clientX, clientY) {
+    state.interaction.mode = "pan"
+    state.interaction.startX = clientX
+    state.interaction.startY = clientY
+    state.interaction.moved = false
+  }
+
+  function startNodeDrag(nodeId, clientX, clientY) {
+    state.interaction.mode = "node"
+    state.interaction.nodeId = nodeId
+    state.interaction.startX = clientX
+    state.interaction.startY = clientY
+    state.interaction.moved = false
+  }
+
+  svg.addEventListener("wheel", (event) => {
+    event.preventDefault()
+    const rect = svg.getBoundingClientRect()
+    const mx = event.clientX - rect.left
+    const my = event.clientY - rect.top
+    const previousScale = state.transform.scale
+    const nextScale = Math.max(0.15, Math.min(2.8, previousScale * (event.deltaY > 0 ? 0.9 : 1.1)))
+
+    const wx = (mx - state.transform.x) / previousScale
+    const wy = (my - state.transform.y) / previousScale
+
+    state.transform.scale = nextScale
+    state.transform.x = mx - wx * nextScale
+    state.transform.y = my - wy * nextScale
+    state.autoFit = false
+    applyTransform()
+  }, { passive: false })
+
+  svg.addEventListener("mousedown", (event) => {
+    const targetNode = event.target.closest(".node")
+    if (targetNode) {
+      startNodeDrag(targetNode.dataset.nodeId, event.clientX, event.clientY)
+      return
+    }
+    startPan(event.clientX, event.clientY)
+  })
+
+  window.addEventListener("mousemove", (event) => {
+    if (!state.interaction.mode) return
+
+    const dx = event.clientX - state.interaction.startX
+    const dy = event.clientY - state.interaction.startY
+    if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+      state.interaction.moved = true
+    }
+
+    if (state.interaction.mode === "pan") {
+      state.transform.x += dx
+      state.transform.y += dy
+      state.interaction.startX = event.clientX
+      state.interaction.startY = event.clientY
+      state.autoFit = false
+      applyTransform()
+      return
+    }
+
+    if (state.interaction.mode === "node" && state.graph) {
+      const point = worldPoint(event.clientX, event.clientY)
+      const node = state.graph.nodes.find((item) => item.id === state.interaction.nodeId)
+      if (!node) return
+      node.x = point.x
+      node.y = point.y
+      node.vx = 0
+      node.vy = 0
+      state.autoFit = false
+      updateGeometry()
+    }
+  })
+
+  window.addEventListener("mouseup", (event) => {
+    if (!state.interaction.mode) return
+
+    const { mode, nodeId, moved } = state.interaction
+    state.interaction.mode = null
+
+    if (mode === "node" && !moved && nodeId && state.graph) {
+      const node = state.graph.nodes.find((item) => item.id === nodeId)
+      if (node) {
+        chrome.tabs.create({ url: node.url })
+      }
+    }
+
+    state.interaction.nodeId = null
+    state.interaction.startX = event.clientX
+    state.interaction.startY = event.clientY
+  })
+
+  window.addEventListener("resize", () => {
+    if (state.autoFit) {
+      fitGraphToViewport()
+    } else {
+      applyTransform()
+    }
+  })
+}
+
+async function init() {
+  bindControls()
+  bindCanvasInteractions()
+  await refreshAll()
+
+  const debouncedRefresh = debounce(async () => {
+    try {
+      await refreshAll()
+    } catch (error) {
+      getEl("statsText").textContent = `刷新失败: ${error.message}`
+    }
+  }, 350)
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return
+    const keys = Object.keys(changes)
+    if (!keys.length) return
+    debouncedRefresh()
+  })
+}
+
+init().catch((error) => {
+  getEl("statsText").textContent = `初始化失败: ${error.message}`
+})
